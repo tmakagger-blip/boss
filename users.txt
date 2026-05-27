@@ -1,0 +1,11 @@
+# Boss直聘用户列表
+# 每行一个，支持以下格式：
+#   1. 简历页 URL:  https://www.zhipin.com/resume/xxxxxxxxxxxxxxxx.html
+#   2. 用户主页 URL: https://www.zhipin.com/candidate/xxxxxxxxxxxxxxxx.html
+#   3. 已有聊天的 IM 用户 ID（纯数字或字符串）
+#
+# 以 # 开头的行为注释，空行忽略
+
+# 示例（替换为真实链接）：
+# https://www.zhipin.com/resume/aabbccddeeff1122.html
+# https://www.zhipin.com/resume/1234567890abcdef.html

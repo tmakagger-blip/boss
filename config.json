@@ -1,0 +1,10 @@
+{
+  "message": "你好，我看了你的简历，觉得你的背景很适合我们团队，想和你聊聊，方便的话请回复我。",
+  "delay_min": 8,
+  "delay_max": 20,
+  "cookies_file": "cookies.json",
+  "users_file": "users.txt",
+  "log_file": "sent.log",
+  "headless": false,
+  "timeout": 30000
+}
