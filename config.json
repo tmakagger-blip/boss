@@ -6,5 +6,7 @@
   "users_file": "users.txt",
   "log_file": "sent.log",
   "headless": false,
-  "timeout": 30000
+  "timeout": 30000,
+  "edge_cdp_port": 9222,
+  "edge_profile_dir": "edge-boss-profile"
 }

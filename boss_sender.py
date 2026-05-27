@@ -2,21 +2,24 @@
 """
 Boss直聘批量私信工具
 
-用法：
-  # 先保存登录 cookie（浏览器会弹出，手动扫码登录）
-  python boss_sender.py --save-cookies
+用法（Edge 模式，推荐）：
+  # 第一步：用调试模式启动 Edge（只需一次，之后保持 Edge 开着）
+  python boss_sender.py --launch-edge
 
-  # 发送消息（读取 config.json 中的配置）
-  python boss_sender.py --send
+  # 第二步：在弹出的 Edge 窗口中登录 Boss直聘
 
-  # 添加用户到 users.txt 并立即发送
-  python boss_sender.py --add "https://www.zhipin.com/resume/xxx.html" --send
+  # 第三步：发送消息
+  python boss_sender.py --send --use-edge
 
-  # 批量添加用户
-  python boss_sender.py --add-file new_users.txt --send
+用法（内置浏览器模式）：
+  python boss_sender.py --save-cookies   # 扫码登录保存 Cookie
+  python boss_sender.py --send           # 发送消息
 
-  # 查看已发送记录
+其他命令：
+  python boss_sender.py --add "https://www.zhipin.com/resume/xxx.html"
+  python boss_sender.py --add-file new_users.txt
   python boss_sender.py --status
+  python boss_sender.py --retry-failed --send --use-edge
 """
 
 import argparse
@@ -25,6 +28,7 @@ import logging
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -42,6 +46,8 @@ DEFAULT_CONFIG = {
     "log_file": "sent.log",
     "headless": False,
     "timeout": 30000,
+    "edge_cdp_port": 9222,
+    "edge_profile_dir": "edge-boss-profile",
 }
 
 logging.basicConfig(
@@ -122,12 +128,78 @@ def record_sent(log_file: str, user: str, status: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Edge helpers
+# ---------------------------------------------------------------------------
+
+EDGE_PATHS = [
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    "/usr/bin/microsoft-edge",
+    "/usr/bin/microsoft-edge-stable",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+]
+
+
+def find_edge() -> str | None:
+    for p in EDGE_PATHS:
+        if Path(p).exists():
+            return p
+    # Try PATH
+    import shutil
+    return shutil.which("msedge") or shutil.which("microsoft-edge")
+
+
+def launch_edge(cfg: dict) -> None:
+    """Launch Edge with remote debugging port so the script can connect to it."""
+    edge = find_edge()
+    if not edge:
+        log.error("未找到 Edge 浏览器，请手动指定路径后重试。")
+        log.error("手动启动方式（在命令行运行）：")
+        _print_manual_launch(cfg)
+        return
+
+    port = cfg["edge_cdp_port"]
+    profile_dir = str(Path(cfg["edge_profile_dir"]).resolve())
+    Path(profile_dir).mkdir(exist_ok=True)
+
+    cmd = [
+        edge,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "https://www.zhipin.com",
+    ]
+
+    log.info("正在启动 Edge（调试模式）……")
+    log.info("Edge 启动后请在窗口中登录 Boss直聘，然后运行:")
+    log.info("  python boss_sender.py --send --use-edge")
+
+    if sys.platform == "win32":
+        subprocess.Popen(cmd, creationflags=subprocess.DETACHED_PROCESS)
+    else:
+        subprocess.Popen(cmd, start_new_session=True)
+
+    log.info("Edge 已在后台启动，请查看弹出的浏览器窗口。")
+
+
+def _print_manual_launch(cfg: dict) -> None:
+    port = cfg["edge_cdp_port"]
+    profile_dir = str(Path(cfg["edge_profile_dir"]).resolve())
+    print(
+        f'\n"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"'
+        f" --remote-debugging-port={port}"
+        f' --user-data-dir="{profile_dir}"'
+        f" https://www.zhipin.com\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Browser helpers
 # ---------------------------------------------------------------------------
 
 BOSS_HOME = "https://www.zhipin.com"
 BOSS_IM = "https://www.zhipin.com/web/im/"
-
 
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -137,8 +209,8 @@ window.chrome = {runtime: {}};
 """.strip()
 
 
-def make_browser(playwright, cfg: dict, storage_state=None):
-    """Launch a Chromium browser with anti-detection flags."""
+def make_builtin_browser(playwright, cfg: dict, storage_state=None):
+    """Launch the built-in Chromium with anti-detection flags."""
     launch_opts = {
         "headless": cfg["headless"],
         "args": [
@@ -164,19 +236,43 @@ def make_browser(playwright, cfg: dict, storage_state=None):
     return browser, ctx
 
 
+def connect_edge(playwright, cfg: dict):
+    """Connect to an already-running Edge via CDP."""
+    port = cfg["edge_cdp_port"]
+    cdp_url = f"http://localhost:{port}"
+    log.info("正在连接 Edge (CDP: %s)……", cdp_url)
+    try:
+        browser = playwright.chromium.connect_over_cdp(cdp_url)
+    except Exception as e:
+        log.error("无法连接到 Edge：%s", e)
+        log.error("请先运行:  python boss_sender.py --launch-edge")
+        log.error("或手动以调试模式启动 Edge：")
+        _print_manual_launch(cfg)
+        sys.exit(1)
+
+    # Reuse existing context (already logged in) or create one
+    contexts = browser.contexts
+    if contexts:
+        ctx = contexts[0]
+        log.info("已连接到 Edge，复用现有会话。")
+    else:
+        ctx = browser.new_context()
+        log.info("已连接到 Edge，创建新会话。")
+
+    return browser, ctx
+
+
 def save_cookies(cfg: dict) -> None:
-    """Open browser, let user log in manually, then save storage state."""
+    """Open built-in browser, let user log in manually, then save storage state."""
     cookies_file = cfg["cookies_file"]
-    log.info("即将打开浏览器，请手动扫码登录 Boss直聘，登录成功后请勿关闭浏览器。")
-    log.info("登录完成后，脚本会自动保存 Cookie 并关闭浏览器。")
+    log.info("即将打开浏览器，请手动扫码登录 Boss直聘。")
 
     with sync_playwright() as p:
-        browser, ctx = make_browser(p, {**cfg, "headless": False})
+        browser, ctx = make_builtin_browser(p, {**cfg, "headless": False})
         page = ctx.new_page()
         page.goto(BOSS_HOME, wait_until="networkidle", timeout=60000)
         log.info("请在浏览器中完成登录……")
 
-        # Wait until the user is logged in (profile avatar appears)
         try:
             page.wait_for_selector(
                 "a.nav-figure, .user-nav .figure, .nav-user-info",
@@ -196,13 +292,7 @@ def save_cookies(cfg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _send_to_resume_url(page, cfg: dict, url: str) -> bool:
-    """
-    Navigate to a resume/candidate profile page and click 立即沟通,
-    then type and send the message.
-    Returns True on success.
-    """
     timeout = cfg["timeout"]
-    message = cfg["message"]
 
     log.info("打开简历页: %s", url)
     try:
@@ -211,7 +301,6 @@ def _send_to_resume_url(page, cfg: dict, url: str) -> bool:
         log.error("页面加载超时: %s", url)
         return False
 
-    # Click the 立即沟通 / 打招呼 button
     btn_selectors = [
         "a.btn-greet",
         "a.op-btn-greet",
@@ -244,9 +333,6 @@ def _send_to_resume_url(page, cfg: dict, url: str) -> bool:
 
 
 def _send_to_im_contact(page, cfg: dict, uid: str) -> bool:
-    """
-    Navigate to the IM panel for an already-established contact by uid.
-    """
     timeout = cfg["timeout"]
     im_url = f"{BOSS_IM}?id={uid}"
     log.info("打开聊天页: %s", im_url)
@@ -260,11 +346,6 @@ def _send_to_im_contact(page, cfg: dict, uid: str) -> bool:
 
 
 def _fill_and_send(page, cfg: dict) -> bool:
-    """
-    Find the chat input box, type the message and submit.
-    Returns True on success.
-    """
-    timeout = cfg["timeout"]
     message = cfg["message"]
 
     input_selectors = [
@@ -277,7 +358,6 @@ def _fill_and_send(page, cfg: dict) -> bool:
         "[class*='message-input']",
     ]
 
-    # Wait for chat dialog / input to appear
     time.sleep(2)
 
     input_el = None
@@ -301,7 +381,6 @@ def _fill_and_send(page, cfg: dict) -> bool:
         input_el.fill(message)
         time.sleep(0.5)
 
-        # Try send button first, then Enter
         send_selectors = [
             "button.btn-send",
             "button[type='submit']",
@@ -336,15 +415,16 @@ def _is_resume_url(url: str) -> bool:
     return re.search(r"zhipin\.com/(resume|candidate)/", url) is not None
 
 
-def send_messages(cfg: dict) -> None:
-    cookies_file = cfg["cookies_file"]
+def send_messages(cfg: dict, use_edge: bool = False) -> None:
     users_file = cfg["users_file"]
     log_file = cfg["log_file"]
     delay_min = cfg["delay_min"]
     delay_max = cfg["delay_max"]
 
-    if not Path(cookies_file).exists():
-        log.error("Cookie 文件不存在，请先运行: python boss_sender.py --save-cookies")
+    if not use_edge and not Path(cfg["cookies_file"]).exists():
+        log.error("Cookie 文件不存在。")
+        log.error("方案一（推荐）: python boss_sender.py --launch-edge  然后 --send --use-edge")
+        log.error("方案二:         python boss_sender.py --save-cookies  然后 --send")
         sys.exit(1)
 
     users = load_users(users_file)
@@ -361,15 +441,18 @@ def send_messages(cfg: dict) -> None:
         return
 
     with sync_playwright() as p:
-        browser, ctx = make_browser(p, cfg, storage_state=cookies_file)
-        page = ctx.new_page()
-
-        # Quick login check
-        page.goto(BOSS_HOME, wait_until="domcontentloaded", timeout=cfg["timeout"])
-        if "login" in page.url or page.locator(".login-panel").is_visible(timeout=2000):
-            log.error("Cookie 已失效，请重新运行 --save-cookies 登录。")
-            browser.close()
-            sys.exit(1)
+        if use_edge:
+            browser, ctx = connect_edge(p, cfg)
+            # Check login state via a new page
+            page = ctx.new_page()
+        else:
+            browser, ctx = make_builtin_browser(p, cfg, storage_state=cfg["cookies_file"])
+            page = ctx.new_page()
+            page.goto(BOSS_HOME, wait_until="domcontentloaded", timeout=cfg["timeout"])
+            if "login" in page.url:
+                log.error("Cookie 已失效，请重新运行 --save-cookies 或改用 --use-edge。")
+                browser.close()
+                sys.exit(1)
 
         success_count = 0
         fail_count = 0
@@ -377,17 +460,12 @@ def send_messages(cfg: dict) -> None:
         for i, user in enumerate(pending, 1):
             log.info("[%d/%d] 处理: %s", i, len(pending), user)
 
-            if _is_resume_url(user):
-                ok = _send_to_resume_url(page, cfg, user)
-            elif user.startswith("http"):
-                # generic URL – try resume flow
+            if _is_resume_url(user) or user.startswith("http"):
                 ok = _send_to_resume_url(page, cfg, user)
             else:
-                # Treat as IM uid
                 ok = _send_to_im_contact(page, cfg, user)
 
-            status = "success" if ok else "failed"
-            record_sent(log_file, user, status)
+            record_sent(log_file, user, "success" if ok else "failed")
 
             if ok:
                 success_count += 1
@@ -399,7 +477,11 @@ def send_messages(cfg: dict) -> None:
                 log.info("等待 %.1f 秒后继续……", delay)
                 time.sleep(delay)
 
-        browser.close()
+        if not use_edge:
+            browser.close()
+        else:
+            log.info("Edge 保持运行，脚本已完成操作。")
+
         log.info("发送完毕：成功 %d，失败 %d。", success_count, fail_count)
 
 
@@ -450,9 +532,19 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     parser.add_argument(
+        "--launch-edge",
+        action="store_true",
+        help="以调试模式启动本地 Edge 浏览器（启动后在 Edge 里登录 Boss直聘）",
+    )
+    parser.add_argument(
+        "--use-edge",
+        action="store_true",
+        help="连接到已启动的 Edge 浏览器发送消息（配合 --launch-edge 使用）",
+    )
+    parser.add_argument(
         "--save-cookies",
         action="store_true",
-        help="打开浏览器手动登录并保存 Cookie",
+        help="用内置浏览器手动登录并保存 Cookie（不使用 Edge 时的备用方案）",
     )
     parser.add_argument(
         "--send",
@@ -483,12 +575,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retry-failed",
         action="store_true",
-        help="重试所有失败的用户",
+        help="重试所有失败的用户，配合 --send 使用",
     )
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="以无头模式运行（不显示浏览器窗口）",
+        help="内置浏览器以无头模式运行（不显示窗口）",
     )
     return parser
 
@@ -504,10 +596,13 @@ def main() -> None:
     if args.headless:
         cfg["headless"] = True
 
-    if not any([args.save_cookies, args.send, args.add, args.add_file,
-                args.status, args.retry_failed]):
+    if not any([args.launch_edge, args.use_edge, args.save_cookies, args.send,
+                args.add, args.add_file, args.status, args.retry_failed]):
         parser.print_help()
         return
+
+    if args.launch_edge:
+        launch_edge(cfg)
 
     if args.save_cookies:
         save_cookies(cfg)
@@ -527,7 +622,6 @@ def main() -> None:
         log.info("从 %s 成功添加 %d 个新用户。", args.add_file, n)
 
     if args.retry_failed:
-        # Remove failed entries from log so they will be retried
         log_file = Path(cfg["log_file"])
         if log_file.exists():
             lines = log_file.read_text(encoding="utf-8").splitlines()
@@ -540,7 +634,7 @@ def main() -> None:
         print_status(cfg)
 
     if args.send:
-        send_messages(cfg)
+        send_messages(cfg, use_edge=args.use_edge)
 
 
 if __name__ == "__main__":
