@@ -129,14 +129,38 @@ BOSS_HOME = "https://www.zhipin.com"
 BOSS_IM = "https://www.zhipin.com/web/im/"
 
 
+STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+window.chrome = {runtime: {}};
+""".strip()
+
+
 def make_browser(playwright, cfg: dict, storage_state=None):
-    """Launch a Chromium browser; load cookies/storage if available."""
-    launch_opts = {"headless": cfg["headless"]}
-    ctx_opts: dict = {"viewport": {"width": 1280, "height": 900}}
+    """Launch a Chromium browser with anti-detection flags."""
+    launch_opts = {
+        "headless": cfg["headless"],
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    }
+    ctx_opts: dict = {
+        "viewport": {"width": 1280, "height": 900},
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
     if storage_state and Path(storage_state).exists():
         ctx_opts["storage_state"] = storage_state
     browser = playwright.chromium.launch(**launch_opts)
     ctx = browser.new_context(**ctx_opts)
+    ctx.add_init_script(STEALTH_SCRIPT)
     return browser, ctx
 
 
